@@ -155,9 +155,31 @@ export const getStreamingResponse = async (
     
     // Safely access environment variables with fallbacks
     const apiKey = "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";
-    const modelId = "mistralai/Mistral-7B-Instruct-v0.2";
+    // Only use Mistral model because models >10B can't load automatically with current API setup
+  const modelId = "mistralai/Mistral-7B-Instruct-v0.3";
+    // const modelId = "google/gemma-7b-it";
+    // const modelId = "GritLM/GritLM-7B";
+    // const modelId = "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
+  // const modelId = "tiiuae/falcon-7b-instruct";
+    // const modelId = "meta-llama/Llama-2-7b-chat-hf";
+    // const modelId = "Qwen/Qwen1.5-7B-Chat";
+    // const modelId = "lmsys/vicuna-7b-v1.5";
+    // const modelId = "HuggingFaceH4/zephyr-7b-gemma-v0.1";
+  // const modelId = "meta-llama/Meta-Llama-3-8B-Instruct";
+    // const modelId = "nvidia/Llama3-ChatQA-1.5-8B";
+  // const modelId = "mistralai/Mistral-7B-Instruct-v0.3";
+  // const modelId = "google/gemma-1.1-7b-it";
+  // const modelId = "mistralai/Mistral-Nemo-Instruct-2407";
+    // const modelId = "meta-llama/Llama-3.1-8B-Instruct";
+    // const modelId = "Qwen/Qwen2.5-Coder-3B-Instruct";
+    // const modelId = "cerebras/btlm-3b-8k-base";
     
-    // Check if API key is available
+    // Other model options are commented out as they exceed size limitations:
+    // const modelId = 'deepseek-ai/deepseek-coder-6.7b-instruct';
+    // const modelId = 'deepseek-ai/deepseek-llm-7b-chat';
+    // const modelId = 'deepseek-ai/deepseek-coder-33b-instruct';
+
+        // Check if API key is available
     if (!apiKey) {
       console.error("Missing Hugging Face API key");
       throw new Error("API key is not configured");
