@@ -1,5 +1,5 @@
-// src/services/ai/index.ts
-import { HfInference } from '@huggingface/inference';
+// src/services/chat/index.ts
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
 
 // Types for messages and responses
 export interface ChatMessage {
@@ -142,51 +142,50 @@ Keep responses concise (1-2 paragraphs) and conversational, while prioritizing u
 };
 
 /**
- * Gets a streaming response from the Hugging Face Inference API
- * Removed assessment data parameter and references
+ * Gets a streaming response from Google Gemini API
  */
 export const getStreamingResponse = async (
   messages: ChatMessage[],
   onToken: (token: string) => void
 ): Promise<ChatResponse> => {
   try {
-    // Log for debugging
-    console.log("Starting AI request with Hugging Face...");
+    console.log("Starting Gemini API request...");
     
-    // Safely access environment variables with fallbacks
-    const apiKey = "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";
-    // Only use Mistral model because models >10B can't load automatically with current API setup
-  const modelId = "mistralai/Mistral-7B-Instruct-v0.3";
-    // const modelId = "google/gemma-7b-it";
-    // const modelId = "GritLM/GritLM-7B";
-    // const modelId = "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
-  // const modelId = "tiiuae/falcon-7b-instruct";
-    // const modelId = "meta-llama/Llama-2-7b-chat-hf";
-    // const modelId = "Qwen/Qwen1.5-7B-Chat";
-    // const modelId = "lmsys/vicuna-7b-v1.5";
-    // const modelId = "HuggingFaceH4/zephyr-7b-gemma-v0.1";
-  // const modelId = "meta-llama/Meta-Llama-3-8B-Instruct";
-    // const modelId = "nvidia/Llama3-ChatQA-1.5-8B";
-  // const modelId = "mistralai/Mistral-7B-Instruct-v0.3";
-  // const modelId = "google/gemma-1.1-7b-it";
-  // const modelId = "mistralai/Mistral-Nemo-Instruct-2407";
-    // const modelId = "meta-llama/Llama-3.1-8B-Instruct";
-    // const modelId = "Qwen/Qwen2.5-Coder-3B-Instruct";
-    // const modelId = "cerebras/btlm-3b-8k-base";
-    
-    // Other model options are commented out as they exceed size limitations:
-    // const modelId = 'deepseek-ai/deepseek-coder-6.7b-instruct';
-    // const modelId = 'deepseek-ai/deepseek-llm-7b-chat';
-    // const modelId = 'deepseek-ai/deepseek-coder-33b-instruct';
-
-        // Check if API key is available
+    // Get API key from environment
+    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
     if (!apiKey) {
-      console.error("Missing Hugging Face API key");
-      throw new Error("API key is not configured");
+      throw new Error("Gemini API key is not configured");
     }
     
-    // Create HuggingFace Inference instance
-    const hf = new HfInference(apiKey);
+    // Initialize Gemini AI
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-1.5-flash",
+      generationConfig: {
+        temperature: 0.7,
+        topP: 0.8,
+        topK: 40,
+        maxOutputTokens: 1000,
+      },
+      safetySettings: [
+        {
+          category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        },
+        {
+          category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, 
+          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        },
+        {
+          category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        },
+        {
+          category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        },
+      ],
+    });
     
     // Extract the user message
     const userMessage = messages.filter(m => m.role === 'user').pop()?.content || '';
@@ -197,78 +196,73 @@ export const getStreamingResponse = async (
     // Check for emergency keywords
     const isEmergency = containsEmergencyKeywords(userMessage);
     
-    // Create context prompt (removed assessment data parameter)
+    // Create context prompt with conversation history
     const contextPrompt = createContextPrompt(userMessage, chatHistory);
     
-    // Format the message for Mistral model
-    const formattedPrompt = `<s>[INST] ${contextPrompt}\n\nUser: ${userMessage} [/INST]`;
+    // Format conversation history for Gemini - must start with user message
+    const conversationHistory = chatHistory
+      .filter((_, index, array) => {
+        // Remove the initial welcome message if it's the first message and from assistant
+        if (index === 0 && array[0].role === 'assistant') {
+          return false;
+        }
+        return true;
+      })
+      .map(msg => ({
+        role: msg.role === 'user' ? 'user' : 'model',
+        parts: [{ text: msg.content }],
+      }));
     
-    console.log("Sending request to Hugging Face API...");
-    console.log("Model ID:", modelId);
-    
-    // Track the full response
-    let fullResponse = '';
-    
-    // Use the textGenerationStream method for streaming responses
-    const stream = await hf.textGenerationStream({
-      model: modelId,
-      inputs: formattedPrompt,
-      parameters: {
-        max_new_tokens: 500,
+    // Start chat session with history
+    const chat = model.startChat({
+      history: conversationHistory,
+      generationConfig: {
         temperature: 0.7,
-        top_p: 0.95,
-        repetition_penalty: 1.15,
-        do_sample: true
-      }
+        topP: 0.8,
+        topK: 40,
+        maxOutputTokens: 1000,
+      },
     });
     
-    console.log("Received stream from Hugging Face API");
+    console.log("Sending message to Gemini...");
+    
+    // Send message and get streaming response
+    const result = await chat.sendMessageStream(`${contextPrompt}\n\nUser: ${userMessage}`);
+    
+    let fullResponse = '';
     
     // Process the stream
-    for await (const response of stream) {
-      const token = response.token.text;
-      fullResponse += token;
-      onToken(token);
+    for await (const chunk of result.stream) {
+      const chunkText = chunk.text();
+      if (chunkText) {
+        fullResponse += chunkText;
+        onToken(chunkText);
+      }
     }
+    
+    console.log("Received complete response from Gemini");
     
     return {
       response: fullResponse,
       isEmergency,
       isError: false
     };
+    
   } catch (error: unknown) {
     const errorObj = error as Error;
-    console.error('AI Response Error:', errorObj);
+    console.error('Gemini API Error:', errorObj);
     
     // Handle different error types with conversational responses
     let errorMessage = ERROR_MESSAGES.default;
     
-    if (
-      errorObj instanceof Error && 
-      (errorObj.message.includes('401') || 
-       errorObj.message.includes('unauthorized') || 
-       errorObj.message.includes('Invalid credentials'))
-    ) {
-      console.error("Authentication error with Hugging Face API");
+    if (errorObj.message?.includes('API key')) {
       errorMessage = ERROR_MESSAGES.authentication;
-    } else if (
-      errorObj instanceof Error && 
-      (errorObj.message.toLowerCase().includes('content') || 
-       errorObj.message.toLowerCase().includes('safety'))
-    ) {
-      errorMessage = ERROR_MESSAGES.safety;
-    } else if (
-      errorObj instanceof Error && 
-      (errorObj.message.toLowerCase().includes('network') ||
-       errorObj.message.toLowerCase().includes('connection'))
-    ) {
-      errorMessage = ERROR_MESSAGES.network;
-    } else if (
-      errorObj instanceof Error && 
-      (errorObj.message.toLowerCase().includes('server') || 
-       errorObj.message.toLowerCase().includes('500'))
-    ) {
+    } else if (errorObj.message?.includes('quota') || errorObj.message?.includes('limit')) {
       errorMessage = ERROR_MESSAGES.server;
+    } else if (errorObj.message?.includes('safety') || errorObj.message?.includes('policy')) {
+      errorMessage = ERROR_MESSAGES.safety;
+    } else if (errorObj.message?.includes('network') || errorObj.message?.includes('connection')) {
+      errorMessage = ERROR_MESSAGES.network;
     }
     
     return {
@@ -280,27 +274,60 @@ export const getStreamingResponse = async (
 };
 
 /**
- * Non-streaming version that returns the complete response
- * Kept assessmentData parameter for backward compatibility but it's not used
+ * Non-streaming version that returns the complete response using Gemini
  */
 export const getAIResponse = async (
   messages: ChatMessage[],
 ): Promise<ChatResponse> => {
-  let finalResponse = '';
-  
   try {
-    await getStreamingResponse(
-      messages,
-      (token: string) => { finalResponse += token; }
-    );
+    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("Gemini API key is not configured");
+    }
+    
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-1.5-flash",
+      generationConfig: {
+        temperature: 0.7,
+        topP: 0.8,
+        topK: 40,
+        maxOutputTokens: 1000,
+      },
+    });
+    
+    const userMessage = messages.filter(m => m.role === 'user').pop()?.content || '';
+    const chatHistory = messages.slice(0, -1);
+    const isEmergency = containsEmergencyKeywords(userMessage);
+    const contextPrompt = createContextPrompt(userMessage, chatHistory);
+    
+    const conversationHistory = chatHistory
+      .filter((_, index, array) => {
+        // Remove the initial welcome message if it's the first message and from assistant
+        if (index === 0 && array[0].role === 'assistant') {
+          return false;
+        }
+        return true;
+      })
+      .map(msg => ({
+        role: msg.role === 'user' ? 'user' : 'model',
+        parts: [{ text: msg.content }],
+      }));
+    
+    const chat = model.startChat({
+      history: conversationHistory,
+    });
+    
+    const result = await chat.sendMessage(`${contextPrompt}\n\nUser: ${userMessage}`);
+    const response = await result.response;
     
     return {
-      response: finalResponse,
-      isEmergency: containsEmergencyKeywords(messages[messages.length - 1]?.content || ''),
+      response: response.text(),
+      isEmergency,
       isError: false
     };
   } catch (error) {
-    console.error('AI Response Error:', error);
+    console.error('Gemini API Error:', error);
     return {
       response: ERROR_MESSAGES.default,
       isEmergency: false,

@@ -44,7 +44,6 @@ export default function ChatPage() {
   const [showEmergencyAlert, setShowEmergencyAlert] = useState(false);
   const [showInfoPanel, setShowInfoPanel] = useState(false);
   const [selectedResourceType, setSelectedResourceType] = useState<string | null>(null);
-  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const [inputRows, setInputRows] = useState(1);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -127,13 +126,11 @@ export default function ChatPage() {
       };
       
       setMessages(prev => [...prev, streamingMessage]);
-      setStreamingMessageId(streamingMessageId);
       
-      // Format messages for the AI service
-      const formattedMessages: ChatMessage[] = messages
+      // Format messages for the AI service - include ALL non-streaming messages for full context
+      const allMessages = [...messages, userMessage];
+      const formattedMessages: ChatMessage[] = allMessages
         .filter(msg => !msg.isStreaming) // Don't include previous streaming messages
-        .slice(-10) // Only use the last 10 messages for context
-        .concat(userMessage)
         .map(msg => ({
           role: msg.role,
           content: msg.content
@@ -163,7 +160,6 @@ export default function ChatPage() {
         )
       );
       
-      setStreamingMessageId(null);
     } catch (error) {
       console.error('Error sending message:', error);
       
@@ -176,7 +172,6 @@ export default function ChatPage() {
       };
       
       setMessages(prev => prev.filter(msg => !msg.isStreaming).concat([errorMessage]));
-      setStreamingMessageId(null);
     } finally {
       setLoading(false);
     }
