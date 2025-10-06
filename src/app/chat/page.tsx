@@ -137,7 +137,7 @@ export default function ChatPage() {
         }));
       
       // Get streaming response from AI
-      await getStreamingResponse(
+      const result = await getStreamingResponse(
         formattedMessages,
         (token) => {
           // Update the streaming message with each new token
@@ -152,26 +152,36 @@ export default function ChatPage() {
       );
       
       // Mark the message as no longer streaming
-      setMessages(prev => 
-        prev.map(msg => 
+      setMessages(prev => {
+        const updated = prev.map(msg => 
           msg.id === streamingMessageId 
             ? { ...msg, isStreaming: false }
             : msg
-        )
-      );
+        );
+        // If nothing was streamed, fall back to full response text
+        const current = updated.find(m => m.id === streamingMessageId);
+        if (current && (!current.content || current.content.trim().length === 0)) {
+          return updated.map(m => 
+            m.id === streamingMessageId ? { ...m, content: result.response ?? '' } : m
+          );
+        }
+        return updated;
+      });
       
     } catch (error) {
       console.error('Error sending message:', error);
       
-      // Add error message
-      const errorMessage: Message = {
-        id: Date.now().toString(),
-        content: 'Sorry, I encountered an error. Please try again.',
-        role: 'assistant',
-        timestamp: new Date()
-      };
-      
-      setMessages(prev => prev.filter(msg => !msg.isStreaming).concat([errorMessage]));
+      // Ensure any streaming placeholder is removed/updated with a friendly message
+      setMessages(prev => {
+        const friendly = 'Sorry, I encountered an error. Please try again.';
+        const withoutStreaming = prev.filter(msg => !msg.isStreaming);
+        return withoutStreaming.concat([{
+          id: Date.now().toString(),
+          content: friendly,
+          role: 'assistant',
+          timestamp: new Date(),
+        }]);
+      });
     } finally {
       setLoading(false);
     }

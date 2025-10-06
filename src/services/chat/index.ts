@@ -1,5 +1,6 @@
 // src/services/chat/index.ts
-import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
+// NOTE: We intentionally avoid the @google/generative-ai SDK because v0.24.1 targets v1beta endpoints.
+// We call the v1 REST API directly to support gemini-* models reliably.
 
 // Types for messages and responses
 export interface ChatMessage {
@@ -54,6 +55,29 @@ const ERROR_MESSAGES = {
   
   authentication: "I'm having some trouble accessing my full capabilities right now. It's a bit like being locked out of your house - frustrating! Our team is looking into this, and I appreciate your patience."
 };
+
+// REST API constants
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1';
+// Prefer fast model for chat UX; default aligns with working cURL. Allow override via env.
+const GEMINI_MODEL = process.env.NEXT_PUBLIC_GEMINI_MODEL || 'gemini-2.5-flash';
+const USE_SERVER_PROXY = process.env.NEXT_PUBLIC_GEMINI_USE_SERVER === 'true';
+
+// Safety settings for REST API (v1)
+const SAFETY_SETTINGS = [
+  { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+  { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+  { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+  { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+] as const;
+
+const GENERATION_CONFIG = {
+  temperature: 0.7,
+  topP: 0.8,
+  topK: 40,
+  maxOutputTokens: 1000,
+};
+
+type GeminiPart = { text?: string };
 
 /**
  * Checks if a message contains emergency keywords
@@ -157,36 +181,6 @@ export const getStreamingResponse = async (
       throw new Error("Gemini API key is not configured");
     }
     
-    // Initialize Gemini AI
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-1.5-flash",
-      generationConfig: {
-        temperature: 0.7,
-        topP: 0.8,
-        topK: 40,
-        maxOutputTokens: 1000,
-      },
-      safetySettings: [
-        {
-          category: HarmCategory.HARM_CATEGORY_HARASSMENT,
-          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        },
-        {
-          category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, 
-          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        },
-        {
-          category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        },
-        {
-          category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        },
-      ],
-    });
-    
     // Extract the user message
     const userMessage = messages.filter(m => m.role === 'user').pop()?.content || '';
     
@@ -199,53 +193,146 @@ export const getStreamingResponse = async (
     // Create context prompt with conversation history
     const contextPrompt = createContextPrompt(userMessage, chatHistory);
     
-    // Format conversation history for Gemini - must start with user message
-    const conversationHistory = chatHistory
-      .filter((_, index, array) => {
-        // Remove the initial welcome message if it's the first message and from assistant
-        if (index === 0 && array[0].role === 'assistant') {
-          return false;
-        }
-        return true;
-      })
-      .map(msg => ({
-        role: msg.role === 'user' ? 'user' : 'model',
-        parts: [{ text: msg.content }],
-      }));
-    
-    // Start chat session with history
-    const chat = model.startChat({
-      history: conversationHistory,
-      generationConfig: {
-        temperature: 0.7,
-        topP: 0.8,
-        topK: 40,
-        maxOutputTokens: 1000,
+    console.log("Sending message to Gemini (v1 REST stream)...");
+
+    // Build a single user message that includes the context prompt and final user message.
+    const contents = [
+      { role: 'user', parts: [{ text: `${contextPrompt}\n\nUser: ${userMessage}` }] },
+    ];
+
+    // If configured, route via server API to avoid client-side key exposure
+    if (USE_SERVER_PROXY) {
+      const apiResp = await fetch('/api/gemini/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents, generationConfig: GENERATION_CONFIG, safetySettings: SAFETY_SETTINGS, model: GEMINI_MODEL }),
+      });
+      if (!apiResp.ok) {
+        const errText = await apiResp.text().catch(() => '');
+        throw new Error(`API route failed: ${apiResp.status} ${apiResp.statusText} Body: ${errText}`);
+      }
+      const data = await apiResp.json();
+      const text = (data?.text as string) || '';
+      if (text) onToken(text);
+      return { response: text || ERROR_MESSAGES.default, isEmergency, isError: false };
+    }
+
+    const streamUrl = `${GEMINI_API_BASE}/models/${encodeURIComponent(GEMINI_MODEL)}:streamGenerateContent?key=${encodeURIComponent(apiKey)}`;
+    const resp = await fetch(streamUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // Streaming responses are Server-Sent Events
+        'Accept': 'text/event-stream',
       },
+      body: JSON.stringify({ contents, generationConfig: GENERATION_CONFIG, safetySettings: SAFETY_SETTINGS }),
     });
-    
-    console.log("Sending message to Gemini...");
-    
-    // Send message and get streaming response
-    const result = await chat.sendMessageStream(`${contextPrompt}\n\nUser: ${userMessage}`);
-    
-    let fullResponse = '';
-    
-    // Process the stream
-    for await (const chunk of result.stream) {
-      const chunkText = chunk.text();
-      if (chunkText) {
-        fullResponse += chunkText;
-        onToken(chunkText);
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      // If 404 on stream endpoint, fall back to non-stream generateContent
+      if (resp.status === 404) {
+        console.warn(`Stream endpoint 404 for ${GEMINI_MODEL}, falling back to non-stream generateContent. URL: ${streamUrl}`);
+        const fallback = await fetch(
+          `${GEMINI_API_BASE}/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents,
+              generationConfig: GENERATION_CONFIG,
+              safetySettings: SAFETY_SETTINGS,
+            }),
+          }
+        );
+        if (!fallback.ok) {
+          const fbText = await fallback.text().catch(() => '');
+          throw new Error(`Fallback generateContent failed: ${fallback.status} ${fallback.statusText} ${fbText}`);
+        }
+        const data = await fallback.json();
+        const text = ((data?.candidates?.[0]?.content?.parts || []) as unknown[])
+          .map((p: unknown) => (typeof (p as GeminiPart)?.text === 'string' ? (p as GeminiPart).text! : ''))
+          .join('');
+        if (text) onToken(text);
+        return {
+          response: text || ERROR_MESSAGES.default,
+          isEmergency,
+          isError: false,
+        };
+      }
+      throw new Error(`Gemini stream request failed: ${resp.status} ${resp.statusText} URL: ${streamUrl} Body: ${errText}`);
+    }
+
+    const contentType = resp.headers.get('content-type') || '';
+    // If not event-stream or body missing, try parse as JSON once
+    if (!contentType.includes('text/event-stream') || !resp.body) {
+      const asText = await resp.text();
+      try {
+        const data = JSON.parse(asText);
+        const text = ((data?.candidates?.[0]?.content?.parts || []) as unknown[])
+          .map((p: unknown) => (typeof (p as GeminiPart)?.text === 'string' ? (p as GeminiPart).text! : ''))
+          .join('');
+        if (text) onToken(text);
+        return {
+          response: text || ERROR_MESSAGES.default,
+          isEmergency,
+          isError: false,
+        };
+      } catch {
+        throw new Error(`Unexpected non-stream response. URL: ${streamUrl} Body: ${asText}`);
       }
     }
-    
-    console.log("Received complete response from Gemini");
-    
+
+    // Parse SSE stream
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let fullResponse = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Split into lines and handle complete lines
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (trimmed.startsWith('data:')) {
+          const data = trimmed.slice(5).trim();
+          if (data === '[DONE]') {
+            // Stream finished
+            break;
+          }
+          try {
+            const json = JSON.parse(data);
+            // Extract incremental text tokens
+            const parts = json?.candidates?.[0]?.content?.parts;
+            if (Array.isArray(parts)) {
+              const textChunk = parts
+                .map((p: unknown) => (typeof (p as GeminiPart)?.text === 'string' ? (p as GeminiPart).text! : ''))
+                .join('');
+              if (textChunk) {
+                fullResponse += textChunk;
+                onToken(textChunk);
+              }
+            }
+          } catch {
+            // Ignore non-JSON keep-alive messages
+          }
+        }
+      }
+    }
+
+    console.log("Received complete response from Gemini (v1)");
+
     return {
       response: fullResponse,
       isEmergency,
-      isError: false
+      isError: false,
     };
     
   } catch (error: unknown) {
@@ -285,46 +372,44 @@ export const getAIResponse = async (
       throw new Error("Gemini API key is not configured");
     }
     
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-1.5-flash",
-      generationConfig: {
-        temperature: 0.7,
-        topP: 0.8,
-        topK: 40,
-        maxOutputTokens: 1000,
-      },
-    });
-    
     const userMessage = messages.filter(m => m.role === 'user').pop()?.content || '';
     const chatHistory = messages.slice(0, -1);
     const isEmergency = containsEmergencyKeywords(userMessage);
     const contextPrompt = createContextPrompt(userMessage, chatHistory);
     
-    const conversationHistory = chatHistory
-      .filter((_, index, array) => {
-        // Remove the initial welcome message if it's the first message and from assistant
-        if (index === 0 && array[0].role === 'assistant') {
-          return false;
-        }
-        return true;
-      })
-      .map(msg => ({
-        role: msg.role === 'user' ? 'user' : 'model',
-        parts: [{ text: msg.content }],
-      }));
-    
-    const chat = model.startChat({
-      history: conversationHistory,
-    });
-    
-    const result = await chat.sendMessage(`${contextPrompt}\n\nUser: ${userMessage}`);
-    const response = await result.response;
-    
+    // Build a single user message that includes the context prompt and final user message.
+    const contents = [
+      { role: 'user', parts: [{ text: `${contextPrompt}\n\nUser: ${userMessage}` }] },
+    ];
+
+    const url = `${GEMINI_API_BASE}/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const resp = await fetch(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents,
+          generationConfig: GENERATION_CONFIG,
+          safetySettings: SAFETY_SETTINGS,
+        }),
+      }
+    );
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      throw new Error(`Gemini request failed: ${resp.status} ${resp.statusText} URL: ${url} Body: ${errText}`);
+    }
+
+    const data = await resp.json();
+    const text = ((data?.candidates?.[0]?.content?.parts || []) as unknown[])
+      .map((p: unknown) => (typeof (p as GeminiPart)?.text === 'string' ? (p as GeminiPart).text! : ''))
+      .join('');
+
     return {
-      response: response.text(),
+      response: text || ERROR_MESSAGES.default,
       isEmergency,
-      isError: false
+      isError: false,
     };
   } catch (error) {
     console.error('Gemini API Error:', error);
